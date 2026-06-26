@@ -1,40 +1,20 @@
 #!/usr/bin/env python3
 """
-RunPod Serverless handler — Face Swap (1 scène = 1 job).
+RunPod Serverless handler - Face Swap (1 scene = 1 job).
 
-Reproduit À L'IDENTIQUE la logique de faceswap_batch.py (build_facefusion_command),
-mais SANS création de pod / SSH / install : FaceFusion est déjà cuit dans l'image.
+Le worker TELECHARGE source + refs depuis Drive (service account, lecture seule),
+fait le face swap FaceFusion, puis RENVOIE la video en base64 dans l'output.
 
-Flux d'un job :
-  1. (idempotence) si target_filename existe déjà dans output_folder_id -> skip
-  2. download la source MP4 depuis Drive (source_drive_file_id)
-  3. download les refs PNG depuis references_folder_id
-  4. lance FaceFusion headless-run (mêmes args qu'aujourd'hui)
-  5. upload le MP4 résultat dans output_folder_id (Service Account Drive)
-  6. retourne { status, drive_file_id, filename, runtime_seconds }
-
-Entrée (event["input"]) :
-{
-  "source_drive_file_id": "1AbC...",
-  "target_filename":      "scene_007_faceswap.mp4",
-  "output_folder_id":     "1Out...",        # 07_faceswap_segments
-  "references_folder_id":  "1Ref...",       # face_swap_keyframes
-  "reference_filenames":  ["ref_01.png", "ref_02.png", ...],
-  "faceswap_options":     { ... },          # repris tel quel du face_swap_plan
-  "scene_id":             "sc_07",          # optionnel, pour le log
-  "order":                7                  # optionnel, pour le log
-}
-
-Variables d'environnement requises sur l'endpoint :
-  GOOGLE_SERVICE_ACCOUNT_JSON   le contenu JSON du service account (sa-drive.json)
-  FACEFUSION_WORKDIR            défaut /app
+L'upload final sur Google Drive est fait par n8n (compte OAuth de l'utilisateur),
+car un service account Google n'a PAS de quota de stockage pour uploader dans un
+My Drive personnel (erreur 403 "Service Accounts do not have storage quota").
+C'est le meme principe que l'ancien sidecar : le worker produit, n8n uploade.
 """
-
 import os
-import io
 import json
 import time
 import glob
+import base64
 import shutil
 import tempfile
 import subprocess
@@ -42,7 +22,7 @@ import subprocess
 import runpod
 from google.oauth2 import service_account
 from googleapiclient.discovery import build as gbuild
-from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
+from googleapiclient.http import MediaIoBaseDownload
 
 FACEFUSION_WORKDIR = os.environ.get("FACEFUSION_WORKDIR", "/app")
 SWAPPER_MODEL_DEFAULT = os.environ.get("FACESWAP_SWAPPER_MODEL", "inswapper_128")
@@ -50,9 +30,6 @@ SA_SCOPE = ["https://www.googleapis.com/auth/drive"]
 PER_SCENE_TIMEOUT_SECONDS = int(os.environ.get("PER_SCENE_TIMEOUT_SECONDS", "1800"))
 
 
-# ----------------------------------------------------------------------------
-# Google Drive (Service Account) — mêmes opérations que faceswap_batch.py
-# ----------------------------------------------------------------------------
 def _drive():
     raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if not raw:
@@ -63,10 +40,8 @@ def _drive():
 
 
 def drive_find(svc, parent_id, name):
-    q = (
-        "name = '" + name.replace("'", "\\'") + "' and '"
-        + parent_id + "' in parents and trashed = false"
-    )
+    q = ("name = '" + name.replace("'", "\\'") + "' and '"
+         + parent_id + "' in parents and trashed = false")
     r = svc.files().list(
         q=q, fields="files(id,name)", spaces="drive",
         supportsAllDrives=True, includeItemsFromAllDrives=True,
@@ -84,19 +59,6 @@ def drive_download(svc, file_id, dest_path):
     return os.path.getsize(dest_path)
 
 
-def drive_upload(svc, parent_id, name, src_path, mime="video/mp4"):
-    meta = {"name": name, "parents": [parent_id]}
-    media = MediaFileUpload(src_path, mimetype=mime, resumable=True)
-    f = svc.files().create(
-        body=meta, media_body=media, fields="id,name",
-        supportsAllDrives=True,
-    ).execute()
-    return f
-
-
-# ----------------------------------------------------------------------------
-# Commande FaceFusion — PORTÉE À L'IDENTIQUE de build_facefusion_command()
-# ----------------------------------------------------------------------------
 def build_facefusion_command(refs_glob, target, output, options):
     options = options or {}
     swapper_model = options.get("swapper_model", SWAPPER_MODEL_DEFAULT)
@@ -123,16 +85,12 @@ def build_facefusion_command(refs_glob, target, output, options):
     return " ".join(parts)
 
 
-# ----------------------------------------------------------------------------
-# Handler RunPod
-# ----------------------------------------------------------------------------
 def handler(event):
     t0 = time.time()
     inp = event.get("input") or {}
 
     source_id = inp.get("source_drive_file_id")
     target_filename = inp.get("target_filename")
-    output_folder_id = inp.get("output_folder_id")
     refs_folder_id = inp.get("references_folder_id")
     ref_filenames = inp.get("reference_filenames") or []
     options = inp.get("faceswap_options") or {}
@@ -142,7 +100,6 @@ def handler(event):
     missing = [k for k, v in {
         "source_drive_file_id": source_id,
         "target_filename": target_filename,
-        "output_folder_id": output_folder_id,
         "references_folder_id": refs_folder_id,
     }.items() if not v]
     if missing:
@@ -154,19 +111,6 @@ def handler(event):
     except Exception as e:
         return {"status": "error", "code": "DRIVE_AUTH", "message": str(e)[:300]}
 
-    # 1. Idempotence — si la sortie existe déjà, on ne refait pas (et $0)
-    try:
-        existing = drive_find(svc, output_folder_id, target_filename)
-        if existing:
-            return {
-                "status": "ok", "skipped": True, "code": "OUTPUT_EXISTS",
-                "drive_file_id": existing[0]["id"], "filename": target_filename,
-                "order": order, "scene_id": scene_id,
-                "runtime_seconds": round(time.time() - t0, 1),
-            }
-    except Exception as e:
-        return {"status": "error", "code": "DRIVE_FIND", "message": str(e)[:300]}
-
     workdir = tempfile.mkdtemp(prefix="fsjob_")
     refs_dir = os.path.join(workdir, "refs")
     os.makedirs(refs_dir, exist_ok=True)
@@ -174,10 +118,10 @@ def handler(event):
     output_path = os.path.join(workdir, "out.mp4")
 
     try:
-        # 2. Download source
+        # 1. Download source MP4 (read via service account)
         drive_download(svc, source_id, target_path)
 
-        # 3. Download refs (par nom dans le dossier refs)
+        # 2. Download reference PNGs by name
         for fn in ref_filenames:
             found = drive_find(svc, refs_folder_id, fn)
             if not found:
@@ -191,31 +135,30 @@ def handler(event):
                     "message": "no .png refs downloaded",
                     "order": order, "scene_id": scene_id}
 
-        # 4. FaceFusion
+        # 3. FaceFusion
         cmd = build_facefusion_command(
-            refs_glob=os.path.join(refs_dir, "*.png"),
-            target=target_path,
-            output=output_path,
-            options=options,
-        )
+            os.path.join(refs_dir, "*.png"), target_path, output_path, options)
         proc = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            timeout=PER_SCENE_TIMEOUT_SECONDS,
-        )
+            timeout=PER_SCENE_TIMEOUT_SECONDS)
         if proc.returncode != 0 or not os.path.isfile(output_path):
             tail = (proc.stderr or proc.stdout or "")[-800:]
-            return {"status": "error", "code": "FACEFUSION_ERROR",
-                    "message": tail, "order": order, "scene_id": scene_id,
+            return {"status": "error", "code": "FACEFUSION_ERROR", "message": tail,
+                    "order": order, "scene_id": scene_id,
                     "runtime_seconds": round(time.time() - t0, 1)}
 
-        # 5. Upload résultat sur Drive
-        up = drive_upload(svc, output_folder_id, target_filename, output_path)
+        # 4. Return the resulting MP4 as base64 (n8n uploads to Drive via OAuth)
+        with open(output_path, "rb") as fh:
+            data = fh.read()
+        b64 = base64.b64encode(data).decode("ascii")
 
         return {
-            "status": "ok", "skipped": False,
-            "drive_file_id": up["id"], "filename": up["name"],
-            "order": order, "scene_id": scene_id,
-            "size_bytes": os.path.getsize(output_path),
+            "status": "ok",
+            "filename": target_filename,
+            "order": order,
+            "scene_id": scene_id,
+            "size_bytes": len(data),
+            "video_base64": b64,
             "runtime_seconds": round(time.time() - t0, 1),
         }
     except subprocess.TimeoutExpired:
