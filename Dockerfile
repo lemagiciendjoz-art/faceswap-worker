@@ -31,14 +31,8 @@ WORKDIR /app
 
 # [5/6] requirements FaceFusion
 RUN pip install -q -r requirements.txt
-
-# [6/6] install.py FaceFusion (onnxruntime cuda)
 RUN python install.py --onnxruntime cuda --skip-conda
-
-# --- Modèles cuits dans l'image (évite tout download au cold start) ---
-# inswapper_128 (swapper) + gfpgan_1.4 (enhancer) + détecteurs requis.
-# force-download récupère l'ensemble des assets dans /app/.assets.
-RUN python facefusion.py force-download || true
+# [6/6] install.py FaceFusion (onnxruntime cuda)
 
 # Handler serverless
 COPY handler.py /handler.py
