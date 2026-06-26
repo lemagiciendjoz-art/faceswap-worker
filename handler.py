@@ -2,22 +2,26 @@
 """
 RunPod Serverless handler - Face Swap (1 scene = 1 job).
 
-Le worker TELECHARGE source + refs depuis Drive (service account, lecture seule),
-fait le face swap FaceFusion, puis RENVOIE la video en base64 dans l'output.
+Le worker :
+  1. TELECHARGE source + refs depuis Drive (service account, lecture seule).
+  2. Fait le face swap FaceFusion.
+  3. ENVOIE le MP4 resultat (multipart) a un webhook n8n (result_webhook_url),
+     qui l'uploade sur Drive avec l'OAuth de l'utilisateur.
 
-L'upload final sur Google Drive est fait par n8n (compte OAuth de l'utilisateur),
-car un service account Google n'a PAS de quota de stockage pour uploader dans un
-My Drive personnel (erreur 403 "Service Accounts do not have storage quota").
-C'est le meme principe que l'ancien sidecar : le worker produit, n8n uploade.
+Pourquoi pas d'upload Drive direct ni de base64 :
+  - un service account Google n'a pas de quota pour uploader sur un My Drive perso.
+  - le base64 dans la sortie RunPod depasse la limite de taille (sortie supprimee).
+Donc on envoie le fichier directement a n8n (public, OAuth avec quota).
 """
 import os
 import json
 import time
 import glob
-import base64
+import uuid
 import shutil
 import tempfile
 import subprocess
+import urllib.request
 
 import runpod
 from google.oauth2 import service_account
@@ -59,6 +63,23 @@ def drive_download(svc, file_id, dest_path):
     return os.path.getsize(dest_path)
 
 
+def post_multipart(url, fields, file_field, filename, file_bytes,
+                   content_type="video/mp4", timeout=600):
+    """POST multipart/form-data avec urllib (stdlib, pas de dependance)."""
+    boundary = "----fsworker" + uuid.uuid4().hex
+    parts = []
+    for k, v in fields.items():
+        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                      % (boundary, k, v)).encode("utf-8"))
+    head = ("--%s\r\nContent-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+            "Content-Type: %s\r\n\r\n" % (boundary, file_field, filename, content_type)).encode("utf-8")
+    body = b"".join(parts) + head + file_bytes + ("\r\n--%s--\r\n" % boundary).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "multipart/form-data; boundary=%s" % boundary)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read()[:500].decode("utf-8", "replace")
+
+
 def build_facefusion_command(refs_glob, target, output, options):
     options = options or {}
     swapper_model = options.get("swapper_model", SWAPPER_MODEL_DEFAULT)
@@ -91,16 +112,20 @@ def handler(event):
 
     source_id = inp.get("source_drive_file_id")
     target_filename = inp.get("target_filename")
+    output_folder_id = inp.get("output_folder_id")
     refs_folder_id = inp.get("references_folder_id")
     ref_filenames = inp.get("reference_filenames") or []
     options = inp.get("faceswap_options") or {}
+    result_webhook_url = inp.get("result_webhook_url")
     order = inp.get("order")
     scene_id = inp.get("scene_id")
 
     missing = [k for k, v in {
         "source_drive_file_id": source_id,
         "target_filename": target_filename,
+        "output_folder_id": output_folder_id,
         "references_folder_id": refs_folder_id,
+        "result_webhook_url": result_webhook_url,
     }.items() if not v]
     if missing:
         return {"status": "error", "code": "BAD_INPUT",
@@ -118,10 +143,8 @@ def handler(event):
     output_path = os.path.join(workdir, "out.mp4")
 
     try:
-        # 1. Download source MP4 (read via service account)
+        # 1. Download source + refs (read via service account)
         drive_download(svc, source_id, target_path)
-
-        # 2. Download reference PNGs by name
         for fn in ref_filenames:
             found = drive_find(svc, refs_folder_id, fn)
             if not found:
@@ -129,13 +152,12 @@ def handler(event):
                         "message": "ref not found: " + fn,
                         "order": order, "scene_id": scene_id}
             drive_download(svc, found[0]["id"], os.path.join(refs_dir, fn))
-
         if not glob.glob(os.path.join(refs_dir, "*.png")):
             return {"status": "error", "code": "NO_REFS",
                     "message": "no .png refs downloaded",
                     "order": order, "scene_id": scene_id}
 
-        # 3. FaceFusion
+        # 2. FaceFusion
         cmd = build_facefusion_command(
             os.path.join(refs_dir, "*.png"), target_path, output_path, options)
         proc = subprocess.run(
@@ -147,10 +169,23 @@ def handler(event):
                     "order": order, "scene_id": scene_id,
                     "runtime_seconds": round(time.time() - t0, 1)}
 
-        # 4. Return the resulting MP4 as base64 (n8n uploads to Drive via OAuth)
+        # 3. Envoyer le MP4 au webhook n8n (qui uploadera sur Drive via OAuth)
         with open(output_path, "rb") as fh:
             data = fh.read()
-        b64 = base64.b64encode(data).decode("ascii")
+        fields = {
+            "target_filename": target_filename,
+            "output_folder_id": str(output_folder_id),
+            "order": str(order),
+            "scene_id": str(scene_id or ""),
+        }
+        try:
+            code, resp_text = post_multipart(
+                result_webhook_url, fields, "data", target_filename, data)
+        except Exception as e:
+            return {"status": "error", "code": "WEBHOOK_POST_FAILED",
+                    "message": "%s: %s" % (type(e).__name__, str(e)[:300]),
+                    "order": order, "scene_id": scene_id,
+                    "size_bytes": len(data), "runtime_seconds": round(time.time() - t0, 1)}
 
         return {
             "status": "ok",
@@ -158,7 +193,8 @@ def handler(event):
             "order": order,
             "scene_id": scene_id,
             "size_bytes": len(data),
-            "video_base64": b64,
+            "webhook_http_code": code,
+            "webhook_response": resp_text,
             "runtime_seconds": round(time.time() - t0, 1),
         }
     except subprocess.TimeoutExpired:
